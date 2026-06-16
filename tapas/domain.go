@@ -2,76 +2,89 @@ package tapas
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/url"
+	"path"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes tapas as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
-//
-//	import _ "github.com/tamnd/tapas-cli/tapas"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// tapas:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone tapas binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
+// init registers the Domain so a blank import in a multi-domain host enables
+// the tapas:// driver.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the tapas driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the tapas.io driver.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, hosts, and identity for the kit framework.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "tapas",
-		Hosts:  []string{Host},
+		Hosts:  []string{Host, "www.tapas.io"},
 		Identity: kit.Identity{
 			Binary: "tapas",
 			Short:  "Read Tapas.io comics and novel series",
-			Long: `Read Tapas.io comics and novel series
+			Long: `tapas reads public Tapas.io data: series metadata and episode lists.
 
-tapas reads public tapas data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+No account is needed for public content. Discovery is via the public sitemaps
+at tapas.io/sitemap-comic.xml and tapas.io/sitemap-novel.xml.
+
+Quick start:
+  tapas top -n 5                   top 5 comic series (by recency)
+  tapas top --type novel -n 5      top 5 novel series
+  tapas search romance -n 5        series with "romance" in the slug
+  tapas series MATCHPOINT          fetch series details
+  tapas episodes 329873 -n 10      list 10 episodes of series 329873`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/tapas-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and all operations onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `tapas page` and
-	// `ant get tapas://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "search",
+		Group:   "series",
+		List:    true,
+		Summary: "Search series by slug keyword",
+		Args:    []kit.Arg{{Name: "query", Help: "keyword to search in slugs"}},
+	}, searchSeries)
 
-	// List op: members of a page, the home of `tapas links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// tapas://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "top",
+		Group:   "series",
+		List:    true,
+		Summary: "List top (most recently updated) series from the sitemap",
+	}, topSeries)
+
+	kit.Handle(app, kit.OpMeta{
+		Name:     "series",
+		Group:    "series",
+		Single:   true,
+		Resolver: true,
+		URIType:  "series",
+		Summary:  "Fetch series details by slug or id",
+		Args:     []kit.Arg{{Name: "ref", Help: "series slug, numeric id, or URL"}},
+	}, getSeries)
+
+	kit.Handle(app, kit.OpMeta{
+		Name:    "episodes",
+		Group:   "episodes",
+		List:    true,
+		Summary: "List episodes for a series",
+		Args:    []kit.Arg{{Name: "id", Help: "series numeric id or slug"}},
+	}, listEpisodes)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds a Client from the kit-resolved Config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,92 +95,188 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(c), nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type searchInput struct {
+	Query  string  `kit:"arg" help:"keyword to search in series slugs"`
+	Type   string  `kit:"flag" help:"series type: comic or novel"`
+	Limit  int     `kit:"flag,inherit" help:"max results" default:"10"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type topInput struct {
+	Type   string  `kit:"flag" help:"series type: comic or novel" default:"comic"`
+	Limit  int     `kit:"flag,inherit" help:"max results" default:"20"`
+	Client *Client `kit:"inject"`
+}
+
+type seriesInput struct {
+	Ref    string  `kit:"arg" help:"series slug, numeric id, or URL"`
+	Client *Client `kit:"inject"`
+}
+
+type episodesInput struct {
+	ID     string  `kit:"arg" help:"series numeric id or slug"`
+	Limit  int     `kit:"flag,inherit" help:"max episodes" default:"20"`
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func searchSeries(ctx context.Context, in searchInput, emit func(SeriesStub) error) error {
+	stubs, err := fetchSitemapsByType(ctx, in.Client, in.Type)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
+	results := SearchSitemap(stubs, in.Query, in.Limit)
+	if len(results) == 0 {
+		return errs.NotFound("no series found for %q", in.Query)
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for _, s := range results {
+		if err := emit(s); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
+func topSeries(ctx context.Context, in topInput, emit func(SeriesStub) error) error {
+	seriesType := in.Type
+	if seriesType == "" {
+		seriesType = "comic"
+	}
+	stubs, err := in.Client.FetchSitemap(ctx, seriesType)
+	if err != nil {
+		return mapErr(err)
+	}
+	if len(stubs) == 0 {
+		return errs.NotFound("no series found in sitemap")
+	}
+	limit := in.Limit
+	if limit > 0 && len(stubs) > limit {
+		stubs = stubs[:limit]
+	}
+	for _, s := range stubs {
+		if err := emit(s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-// Classify turns any accepted input — a bare path or a full tapas.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+func getSeries(ctx context.Context, in seriesInput, emit func(*Series) error) error {
+	slug := seriesSlug(in.Ref)
+	s, err := in.Client.GetSeries(ctx, slug)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(s)
+}
+
+func listEpisodes(ctx context.Context, in episodesInput, emit func(Episode) error) error {
+	episodes, err := in.Client.GetEpisodes(ctx, in.ID, in.Limit)
+	if err != nil {
+		return mapErr(err)
+	}
+	if len(episodes) == 0 {
+		return errs.NotFound("no episodes found for series %q", in.ID)
+	}
+	for _, ep := range episodes {
+		if err := emit(ep); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// fetchSitemapsByType fetches comic and/or novel sitemaps based on the type flag.
+func fetchSitemapsByType(ctx context.Context, c *Client, seriesType string) ([]SeriesStub, error) {
+	switch strings.ToLower(seriesType) {
+	case "comic":
+		return c.FetchSitemap(ctx, "comic")
+	case "novel":
+		return c.FetchSitemap(ctx, "novel")
+	default:
+		comics, err := c.FetchSitemap(ctx, "comic")
+		if err != nil {
+			return nil, err
+		}
+		novels, err := c.FetchSitemap(ctx, "novel")
+		if err != nil {
+			return comics, nil
+		}
+		return append(comics, novels...), nil
+	}
+}
+
+// Classify turns any accepted input into the canonical (uriType, id).
 func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized tapas reference: %q", input)
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", "", errs.Usage("tapas: empty input")
 	}
-	return "page", id, nil
+	// Full URL: https://tapas.io/series/MATCHPOINT/info or https://tapas.io/series/MATCHPOINT
+	if u, parseErr := url.Parse(input); parseErr == nil && (u.Scheme == "http" || u.Scheme == "https") {
+		slug := seriesSlugFromPath(u.Path)
+		if slug != "" {
+			return "series", slug, nil
+		}
+		return "", "", errs.Usage("tapas: could not extract series slug from URL: %q", input)
+	}
+	// Bare slug or numeric id
+	return "series", input, nil
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
+// Locate returns the canonical URL for a (uriType, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
-		return "", errs.Usage("tapas has no resource type %q", uriType)
+	switch uriType {
+	case "series":
+		return fmt.Sprintf("https://tapas.io/series/%s/info", id), nil
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
+	return "", errs.Usage("tapas has no resource type %q", uriType)
 }
 
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
+// seriesSlug extracts the slug from any input (URL, path, or bare slug).
+func seriesSlug(input string) string {
 	input = strings.TrimSpace(input)
 	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
+		slug := seriesSlugFromPath(u.Path)
+		if slug != "" {
+			return slug
+		}
 	}
-	return strings.Trim(input, "/")
+	return input
 }
 
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// seriesSlugFromPath extracts the series slug from a URL path like /series/SLUG or /series/SLUG/info.
+func seriesSlugFromPath(p string) string {
+	segs := strings.Split(strings.Trim(p, "/"), "/")
+	for i, s := range segs {
+		if s == "series" && i+1 < len(segs) {
+			candidate := segs[i+1]
+			if candidate != "info" && candidate != "episodes" {
+				return candidate
+			}
+		}
+	}
+	return path.Base(p)
+}
+
+// mapErr converts library errors into kit error kinds with appropriate exit codes.
 func mapErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrNotFound) {
+		return errs.NotFound("%s", err.Error())
+	}
+	if errors.Is(err, ErrRateLimited) {
+		return errs.RateLimited("%s", err.Error())
+	}
 	return err
 }
